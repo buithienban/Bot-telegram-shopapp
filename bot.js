@@ -1,4 +1,3 @@
-// @buithienban
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -470,7 +469,7 @@ const I18N = {
         pay_direct_expired: `${P('time')} Đơn thanh toán đã hết hạn. Vui lòng tạo lại.`,
 
         history_empty: `${P('fail')} Chưa có đơn hàng.`,
-        history_title: `${P('orders')} <b>Lịch sử mua hàng</b> (10 gần nhất)`,
+        history_title: `${P('orders')} <b>Lịch sử mua hàng</b>`,
 
         support: (c) => `${P('chat')} Hỗ trợ: ${c}`,
         deposit_success: (a) => `${P('ok')} Nạp thành công <b>${a}</b>!`,
@@ -2343,7 +2342,7 @@ const A = {
             `${i + 1}. <b>${escapeHtml(u.name || 'NoName')}</b>${u.banned ? ' [BANNED]' : ''}\n` +
             `   ${P('plus')} <code>${u.telegramId}</code> | ${P('balance')} ${money(u.balance)} | ${P('total_in')} ${money(u.profit || 0)}`
         ).join('\n');
-        await send(chatId, `${P('plus')} <b>USERS (20 mới nhất)</b>\n\n${lines || 'Trống'}`,
+        await send(chatId, `${P('plus')} <b>USERS</b>\n\n${lines || 'Trống'}`,
             { reply_markup: { inline_keyboard: [[{ text: 'Quay lại', callback_data: 'admin:home', ...CE('back') }]] } },
             { userId });
     },
@@ -2356,7 +2355,7 @@ const A = {
             `   ${P('id_card')} ${escapeHtml(o.userName || o.telegramId)} | ${P('balance')} ${money(o.price)} | ${escapeHtml(o.status)}` +
             (o.profit ? ` | ${P('total_in')} +${money(o.profit)}` : '')
         ).join('\n\n');
-        await send(chatId, `${P('orders')} <b>ĐƠN HÀNG (20 mới nhất)</b>\n\n${lines}`,
+        await send(chatId, `${P('orders')} <b>ĐƠN HÀNG</b>\n\n${lines}`,
             { reply_markup: { inline_keyboard: [[{ text: 'Quay lại', callback_data: 'admin:home', ...CE('back') }]] } },
             { userId });
     },
