@@ -46,3 +46,48 @@ Stack:
 - npm hoặc yarn
 - (Tùy chọn) MySQL >= 5.7 nếu dùng DB_MODE=mysql
 - node namefile.js --addsql để tiêm bảng dữ liệu vào database
+
+An automated sales Telegram bot featuring Premium Emoji support, bank QR top-ups, purchases via balance or direct payment, multi-language support (Vietnamese/English), automatic message cleanup, and seamless operation in both groups and private chats.
+
+---
+
+## Key Features
+
+### Users
+- View Products — Product list fetched from the shop API, including images, descriptions, and prices.
+- Two Purchase Methods:
+- Pay with balance (pre-loaded via QR). 
+- Direct payment — Scan QR for the exact amount; the bot delivers the product automatically.
+- Discount Codes — Enter coupons during purchase; automatic validation via API.
+- Automatic Top-up — Transfer funds with the correct payment reference; the bot automatically credits the account (1-2 minutes).
+- Purchase History — View the 10 most recent orders and download account files.
+- Multi-language — Vietnamese / English.
+- API Documentation — Download .md file or open the Developer link.
+- Support — Contact the admin.
+
+### Admin
+- Statistics — Users, balances, orders, profits, pending QR orders, and discounts.
+- User Management — User list, search, and lock/unlock functions.
+- Orders — View the 20 most recent system-wide orders.
+- Pending QR Orders — List of pending direct payment orders.
+- Manual Top-up — Credit funds to a user via their ID.
+- Discounts — Configure commissions based on a percentage or fixed amount.
+- Broadcast — Send notifications to all users.
+- Configuration — View system information. Stack:
+- node-telegram-bot-api — Telegram Bot API
+- axios — API calls (shop + bank)
+- node-cron — Transaction scanning (every 15s when transactions occur)
+- qrcode — VietQR generation
+- mysql2/promise — MySQL (optional)
+- redis — Transaction locking, state management, and caching to reduce RAM usage
+- dotenv — .env file loading
+
+---
+
+## Installation
+
+### 1. Requirements
+- Node.js >= 16
+- npm or yarn
+- (Optional) MySQL >= 5.7 if using `DB_MODE=mysql`
+- Run `node namefile.js --addsql` to inject database tables
