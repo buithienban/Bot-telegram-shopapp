@@ -43,6 +43,7 @@ Stack:
 
 ### 1. Yêu cầu
 - Node.js >= 16
+- (Tuỳ chọn) pm2 để khời chạy ngầm hiệu quả
 - npm hoặc yarn
 - (Tùy chọn) MySQL >= 5.7 nếu dùng DB_MODE=mysql
 - node namefile.js --addsql để tiêm bảng dữ liệu vào database
@@ -88,6 +89,7 @@ An automated sales Telegram bot featuring Premium Emoji support, bank QR top-ups
 
 ### 1. Requirements
 - Node.js >= 16
+-(Optional) using a pm2 to be more efficient when running
 - npm or yarn
 - (Optional) MySQL >= 5.7 if using `DB_MODE=mysql`
 - Run `node namefile.js --addsql` to inject database tables
