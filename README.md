@@ -12,8 +12,8 @@ Bot Telegram bán hàng tự động, hỗ trợ Premium Emoji, nạp tiền qua
   - Trả bằng số dư (nạp trước qua QR).
   - Thanh toán trực tiếp — Quét QR đúng số tiền, bot tự giao hàng.
 - Mã giảm giá — Nhập coupon khi mua, tự động kiểm tra qua API.
-- Nạp tiền tự động — Chuyển khoản đúng nội dung, bot tự cộng tiền (1-2 phút).
-- Lịch sử mua hàng — Xem 10 đơn gần nhất, tải file tài khoản.
+- Nạp tiền tự động — Chuyển khoản đúng nội dung, bot tự cộng tiền (8-15 giây).
+- Lịch sử mua hàng — Xem tất cả đơn gần nhất, tải file tài khoản.
 - Đa ngôn ngữ — Tiếng Việt / English.
 - Tài liệu API — Tải file .md hoặc mở link Developer.
 - Hỗ trợ — Liên hệ admin.
@@ -21,7 +21,7 @@ Bot Telegram bán hàng tự động, hỗ trợ Premium Emoji, nạp tiền qua
 ### Admin
 - Thống kê — Users, số dư, đơn hàng, lợi nhuận, đơn QR chờ, chiết khấu.
 - Quản lý users — Danh sách, tìm user, khóa/mở khóa.
-- Đơn hàng — 20 đơn mới nhất toàn hệ thống.
+- Đơn hàng — tất cả đơn mới nhất toàn hệ thống.
 - Đơn chờ QR — Danh sách đơn thanh toán trực tiếp đang chờ.
 - Nạp thủ công — Cộng tiền cho user theo ID.
 - Chiết khấu — Cấu hình hoa hồng theo % hoặc số tiền cố định.
@@ -60,8 +60,8 @@ An automated sales Telegram bot featuring Premium Emoji support, bank QR top-ups
 - Pay with balance (pre-loaded via QR). 
 - Direct payment — Scan QR for the exact amount; the bot delivers the product automatically.
 - Discount Codes — Enter coupons during purchase; automatic validation via API.
-- Automatic Top-up — Transfer funds with the correct payment reference; the bot automatically credits the account (1-2 minutes).
-- Purchase History — View the 10 most recent orders and download account files.
+- Automatic Top-up — Transfer funds with the correct payment reference; the bot automatically credits the account (8-15 second).
+- Purchase History — View the all most recent orders and download account files.
 - Multi-language — Vietnamese / English.
 - API Documentation — Download .md file or open the Developer link.
 - Support — Contact the admin.
@@ -69,7 +69,7 @@ An automated sales Telegram bot featuring Premium Emoji support, bank QR top-ups
 ### Admin
 - Statistics — Users, balances, orders, profits, pending QR orders, and discounts.
 - User Management — User list, search, and lock/unlock functions.
-- Orders — View the 20 most recent system-wide orders.
+- Orders — View the all most recent system-wide orders.
 - Pending QR Orders — List of pending direct payment orders.
 - Manual Top-up — Credit funds to a user via their ID.
 - Discounts — Configure commissions based on a percentage or fixed amount.
