@@ -227,4 +227,3 @@ telebot/
 │
 ├── data/
 └── docs/
-
