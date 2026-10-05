@@ -1,4 +1,4 @@
-# Telegram Shop Bot
+# Telegram Shop Bot - đây chỉ là sườn cần nâng có kiến trúc nếu sử dụng lâu dài và kinh doanh - This is merely a structural framework; it requires architectural refinement if intended for long-term use or commercial purposes.
 
 Bot Telegram bán hàng tự động, hỗ trợ Premium Emoji, nạp tiền qua QR ngân hàng, mua bằng số dư hoặc thanh toán trực tiếp, đa ngôn ngữ (Việt/Anh), auto-clean tin nhắn, hoạt động tốt trong group và private chat.
 
