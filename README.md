@@ -95,135 +95,156 @@ An automated sales Telegram bot featuring Premium Emoji support, bank QR top-ups
 
 Kiến trúc mẫu nếu muốn rebuild - Reference architecture for a rebuild
 
+```text
 telebot/
-├── index.js
-├── package.json
-├── .env
-├── .env.example
-├── .gitignore
+├── .env                    # Biến môi trường
+├── .env.example            # Mẫu biến môi trường
+├── .gitignore              # Ignore rules
+├── package.json            # Dependencies và scripts
+├── index.js                # Entry point
 │
-├── src/
-│   ├── config/
-│   │   ├── index.js
-│   │   ├── constants.js
-│   │   └── emoji.js
-│   │
-│   ├── lib/
-│   │   ├── logger.js
-│   │   ├── errors.js
-│   │   ├── money.js
-│   │   ├── html.js
-│   │   ├── mutex.js
-│   │   └── crypto.js
-│   │
-│   ├── infra/
-│   │   ├── redis/
-│   │   │   ├── client.js
-│   │   │   ├── r.js
-│   │   │   └── stateStore.js
-│   │   │
-│   │   ├── db/
-│   │   │   ├── index.js
-│   │   │   ├── json/
-│   │   │   │   └── adapter.js
-│   │   │   └── mysql/
-│   │   │       ├── adapter.js
-│   │   │       └── schema.sql
-│   │   │
-│   │   └── telegram/
-│   │       ├── bot.js
-│   │       ├── tgCall.js
-│   │       ├── sendMessage.js
-│   │       ├── sendMedia.js
-│   │       └── safeSend.js
-│   │
-│   ├── domain/
-│   │   ├── users/
-│   │   │   ├── userService.js
-│   │   │   └── rankService.js
-│   │   │
-│   │   ├── ledger/
-│   │   │   └── ledger.js
-│   │   │
-│   │   ├── orders/
-│   │   │   ├── orderState.js
-│   │   │   └── orderService.js
-│   │   │
-│   │   ├── payments/
-│   │   │   ├── pending.js
-│   │   │   ├── deposit.js
-│   │   │   └── creditHandler.js
-│   │   │
-│   │   ├── products/
-│   │   │   ├── shopApi.js
-│   │   │   └── priceService.js
-│   │   │
-│   │   ├── coupons/
-│   │   │   └── couponService.js
-│   │   │
-│   │   ├── settings/
-│   │   │   └── settings.js
-│   │   │
-│   │   └── bank/
-│   │       ├── bankApi.js
-│   │       └── vietqr.js
-│   │
-│   ├── handlers/
-│   │   ├── user/
-│   │   │   ├── start.js
-│   │   │   ├── products.js
-│   │   │   ├── search.js
-│   │   │   ├── account.js
-│   │   │   ├── deposit.js
-│   │   │   ├── history.js
-│   │   │   ├── language.js
-│   │   │   ├── support.js
-│   │   │   ├── help.js
-│   │   │   └── index.js
-│   │   │
-│   │   ├── admin/
-│   │   │   ├── home.js
-│   │   │   ├── stats.js
-│   │   │   ├── users.js
-│   │   │   ├── orders.js
-│   │   │   ├── pending.js
-│   │   │   ├── stuck.js
-│   │   │   ├── manualDeposit.js
-│   │   │   ├── findUser.js
-│   │   │   ├── balanceAdjust.js
-│   │   │   ├── toggleBan.js
-│   │   │   ├── broadcast.js
-│   │   │   ├── discount.js
-│   │   │   ├── config.js
-│   │   │   └── index.js
-│   │   │
-│   │   └── router/
-│   │       ├── commands.js
-│   │       ├── messages.js
-│   │       ├── callbacks.js
-│   │       └── setupCommands.js
-│   │
-│   ├── i18n/
-│   │   ├── index.js
-│   │   ├── vi.js
-│   │   └── en.js
-│   │
-│   ├── services/
-│   │   ├── purchaseService.js
-│   │   ├── deliveryService.js
-│   │   ├── apiDocsService.js
-│   │   └── notifyService.js
-│   │
-│   ├── workers/
-│   │   ├── bankScanner.js
-│   │   ├── pendingCleanup.js
-│   │   ├── stuckDetector.js
-│   │   └── index.js
-│   │
-│   └── bootstrap/
-│       ├── startup.js
-│       ├── healthcheck.js
-│       └── shutdown.js
+├── data/                   # Runtime data (JSON fallback)
+├── docs/                   # Tài liệu + API doc
 │
-├── data/
-└── docs/
+└── src/
+    │
+    │   --- CONFIG ---
+    │
+    ├── config/
+    │   ├── index.js        #   CFG, ADMIN_IDS, validateEnv
+    │   ├── constants.js    #   API_INFO, BANK_BIN, API_DOC_MD
+    │   └── emoji.js        #   Premium emoji IDs, P(), U(), CE()
+    │
+    │   --- LIB (thuần túy) ---
+    │
+    ├── lib/
+    │   ├── logger.js       #   logger + maskSecret
+    │   ├── errors.js       #   AppError, ErrorCodes
+    │   ├── money.js        #   roundVnd, money
+    │   ├── html.js         #   escapeHtml, sanitizeHtml
+    │   ├── mutex.js        #   withLock (in-process)
+    │   └── crypto.js       #   genOrderId, genPayCode, genDepositCode
+    │
+    │   --- INFRA (kết nối hạ tầng) ---
+    │
+    ├── infra/
+    │   ├── redis/
+    │   │   ├── client.js   #   ioredis singleton + waitReady
+    │   │   ├── r.js        #   R wrapper (get/set/setNX/hset...)
+    │   │   └── stateStore.js # StateStore + Lock (buy/deposit)
+    │   │
+    │   ├── db/
+    │   │   ├── index.js    #   Factory chọn adapter theo DB_MODE
+    │   │   ├── json/
+    │   │   │   └── adapter.js
+    │   │   └── mysql/
+    │   │       ├── adapter.js
+    │   │       └── schema.sql
+    │   │
+    │   └── telegram/
+    │       ├── bot.js      #   TelegramBot instance + api axios
+    │       ├── tgCall.js   #   Retry 429/5xx
+    │       ├── sendMessage.js # sendMessageRaw, editMessageRaw
+    │       ├── sendMedia.js # sendPhotoRaw, sendDocumentRaw
+    │       └── safeSend.js # send, safeSend, sendPhotoSafe
+    │
+    │   --- DOMAIN (nghiệp vụ) ---
+    │
+    ├── domain/
+    │   ├── users/
+    │   │   ├── userService.js #   Wrapper DB user
+    │   │   └── rankService.js #   getRank theo totalIn
+    │   │
+    │   ├── ledger/
+    │   │   └── ledger.js   #   Append-only audit trail
+    │   │
+    │   ├── orders/
+    │   │   ├── orderState.js  # State machine (CREATED/PAID/...)
+    │   │   └── orderService.js# Wrapper DB order
+    │   │
+    │   ├── payments/
+    │   │   ├── pending.js  #   Redis pending orders
+    │   │   ├── deposit.js  #   Scan bank + atomic credit
+    │   │   └── creditHandler.js # Xử lý khi nhận tiền
+    │   │
+    │   ├── products/
+    │   │   ├── shopApi.js  #   Shop API client + cache
+    │   │   └── priceService.js # calcPrice + discount
+    │   │
+    │   ├── coupons/
+    │   │   └── couponService.js
+    │   │
+    │   ├── settings/
+    │   │   └── settings.js #   Discount config
+    │   │
+    │   └── bank/
+    │       ├── bankApi.js  #   Fetch giao dịch + parse
+    │       └── vietqr.js   #   EMVCo QR builder
+    │
+    │   --- HANDLERS (input Telegram) ---
+    │
+    ├── handlers/
+    │   ├── user/
+    │   │   ├── start.js
+    │   │   ├── products.js #   productDetail, buy, pay
+    │   │   ├── search.js
+    │   │   ├── account.js
+    │   │   ├── deposit.js
+    │   │   ├── history.js
+    │   │   ├── language.js
+    │   │   ├── support.js
+    │   │   ├── help.js
+    │   │   └── index.js    #   Object H + mainMenu
+    │   │
+    │   ├── admin/
+    │   │   ├── home.js
+    │   │   ├── stats.js
+    │   │   ├── users.js
+    │   │   ├── orders.js
+    │   │   ├── pending.js
+    │   │   ├── stuck.js
+    │   │   ├── manualDeposit.js
+    │   │   ├── findUser.js
+    │   │   ├── balanceAdjust.js
+    │   │   ├── toggleBan.js
+    │   │   ├── broadcast.js
+    │   │   ├── discount.js
+    │   │   ├── config.js
+    │   │   └── index.js    #   Object A
+    │   │
+    │   └── router/
+    │       ├── commands.js      # bot.onText
+    │       ├── messages.js      # bot.on('message')
+    │       ├── callbacks.js     # bot.on('callback_query')
+    │       └── setupCommands.js # setMyCommands
+    │
+    │   --- I18N ---
+    │
+    ├── i18n/
+    │   ├── index.js        #   t(lang, key, ...args)
+    │   ├── vi.js
+    │   └── en.js
+    │
+    │   --- SERVICES (điều phối) ---
+    │
+    ├── services/
+    │   ├── purchaseService.js # executePurchaseWithRecovery
+    │   ├── deliveryService.js # deliverAccount
+    │   ├── apiDocsService.js  # ensureApiDoc, sendApiDocs
+    │   └── notifyService.js   # notifyAdmins
+    │
+    │   --- WORKERS (cron) ---
+    │
+    ├── workers/
+    │   ├── bankScanner.js  #   Cron 15s quét bank
+    │   ├── pendingCleanup.js # Cron 5min dọn pending
+    │   ├── stuckDetector.js#   Cron 5min phát hiện order lỗi
+    │   └── index.js        #   start() tất cả
+    │
+    │   --- BOOTSTRAP ---
+    │
+    └── bootstrap/
+        ├── startup.js      #   DB.init, Redis ready, commands
+        ├── healthcheck.js  #   checkPremiumSupport
+        └── shutdown.js     #   SIGTERM/SIGINT graceful
+```
