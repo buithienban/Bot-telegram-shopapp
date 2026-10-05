@@ -6,6 +6,7 @@ const cron = require('node-cron');
 const QRCode = require('qrcode');
 const TelegramBot = require('node-telegram-bot-api');
 const Redis = require('ioredis');
+const crypto = require('crypto');
 
 const ADMIN_IDS = (process.env.ADMIN_IDS || '')
     .split(',').map((s) => s.trim()).filter(Boolean);
@@ -39,6 +40,8 @@ const CFG = {
     AUTO_CLEAN: (process.env.AUTO_CLEAN || 'true').toLowerCase() === 'true',
     MAX_TRACKED_MSG: 5,
     STATE_TTL_SEC: 600,
+    BUY_LOCK_SEC: 15,
+    STUCK_ORDER_MIN: 10,
 };
 
 const API_INFO = {
@@ -110,8 +113,28 @@ const BANK_BIN = {
 };
 
 const JSON_FILE = path.join(__dirname, 'data', 'users.json');
+const LEDGER_FILE = path.join(__dirname, 'data', 'ledger.json');
+const ORDER_STATE_FILE = path.join(__dirname, 'data', 'order_state.json');
 const SETTINGS_FILE = path.join(__dirname, 'data', 'settings.json');
 const isAdmin = (tid) => ADMIN_IDS.includes(String(tid));
+
+const ErrorCodes = {
+    VALIDATION_ERROR: 'VALIDATION_ERROR',
+    PAYMENT_ERROR: 'PAYMENT_ERROR',
+    SHOP_API_ERROR: 'SHOP_API_ERROR',
+    DATABASE_ERROR: 'DATABASE_ERROR',
+    TELEGRAM_ERROR: 'TELEGRAM_ERROR',
+    NETWORK_ERROR: 'NETWORK_ERROR',
+    UNKNOWN_ERROR: 'UNKNOWN_ERROR',
+};
+
+class AppError extends Error {
+    constructor(code, message, meta = {}) {
+        super(message);
+        this.code = code;
+        this.meta = meta;
+    }
+}
 
 const RedisClient = (() => {
     if (!CFG.REDIS_ENABLED) return null;
@@ -144,6 +167,15 @@ const R = {
             else await RedisClient.set(key, value);
             return true;
         } catch (e) { console.error('[Redis.set]', e.message); return false; }
+    },
+    async setNX(key, value, ttlSec = null) {
+        if (!RedisClient) return false;
+        try {
+            let res;
+            if (ttlSec) res = await RedisClient.set(key, value, 'EX', ttlSec, 'NX');
+            else res = await RedisClient.set(key, value, 'NX');
+            return res === 'OK';
+        } catch (e) { console.error('[Redis.setNX]', e.message); return false; }
     },
     async setJSON(key, obj, ttlSec = null) {
         return this.set(key, JSON.stringify(obj), ttlSec);
@@ -230,6 +262,9 @@ const StateKeys = {
     coupon: (uid) => `state:coupon:${uid}`,
     tracked: (chatId, uid) => `msg:tracked:${chatId}:${uid}`,
     msgOwner: (msgId) => `msg:owner:${msgId}`,
+    buyLock: (uid, pid) => `lock:buy:${uid}:${pid}`,
+    depositLock: (ref) => `lock:deposit:${ref}`,
+    purchaseLock: (orderId) => `lock:purchase:${orderId}`,
 };
 
 const StateStore = {
@@ -268,6 +303,24 @@ const StateStore = {
     },
     async clearTracked(chatId, userId) {
         await R.del(StateKeys.tracked(chatId, userId));
+    },
+    async acquireBuyLock(userId, productId) {
+        const key = StateKeys.buyLock(userId, productId);
+        const token = crypto.randomBytes(8).toString('hex');
+        const ok = await R.setNX(key, token, CFG.BUY_LOCK_SEC);
+        return ok ? token : null;
+    },
+    async releaseBuyLock(userId, productId, token) {
+        const key = StateKeys.buyLock(userId, productId);
+        const cur = await R.get(key);
+        if (cur === token) await R.del(key);
+    },
+    async acquireDepositLock(ref) {
+        const key = StateKeys.depositLock(ref);
+        return await R.setNX(key, '1', 300);
+    },
+    async releaseDepositLock(ref) {
+        await R.del(StateKeys.depositLock(ref));
     },
 };
 
@@ -350,7 +403,7 @@ const Settings = {
 };
 
 function calcPrice(basePrice) {
-    const base = Number(basePrice) || 0;
+    const base = Math.round(Number(basePrice) || 0);
     const d = Settings.get().discount || { type: 'none', value: 0 };
     let discount = 0;
     if (d.type === 'percent' && d.value > 0) discount = Math.round(base * d.value / 100);
@@ -396,6 +449,7 @@ const I18N = {
         choose_lang: `${P('language')} Chọn ngôn ngữ:`,
         lang_saved: `${P('success')} Đã đổi sang Tiếng Việt`,
         loading: `${P('loading')} Đang xử lý...`,
+        buy_processing: `${P('loading')} Đang xử lý đơn hàng... Vui lòng chờ.`,
 
         account: (b, id, rank, totalIn) =>
             `${P('id_card')} <b>Tài khoản</b>\n\n` +
@@ -469,7 +523,7 @@ const I18N = {
         pay_direct_expired: `${P('time')} Đơn thanh toán đã hết hạn. Vui lòng tạo lại.`,
 
         history_empty: `${P('fail')} Chưa có đơn hàng.`,
-        history_title: `${P('orders')} <b>Lịch sử mua hàng</b>`,
+        history_title: `${P('orders')} <b>Lịch sử mua hàng</b> (10 gần nhất)`,
 
         support: (c) => `${P('chat')} Hỗ trợ: ${c}`,
         deposit_success: (a) => `${P('ok')} Nạp thành công <b>${a}</b>!`,
@@ -510,6 +564,7 @@ const I18N = {
         choose_lang: `${P('language')} Choose language:`,
         lang_saved: `${P('success')} Language changed to English`,
         loading: `${P('loading')} Processing...`,
+        buy_processing: `${P('loading')} Processing order... Please wait.`,
 
         account: (b, id, rank, totalIn) =>
             `${P('id_card')} <b>Account</b>\n\n` +
@@ -635,6 +690,90 @@ function withLock(key, fn) {
     return next;
 }
 
+const Ledger = {
+    _read() {
+        if (!fs.existsSync(LEDGER_FILE)) {
+            fs.mkdirSync(path.dirname(LEDGER_FILE), { recursive: true });
+            fs.writeFileSync(LEDGER_FILE, JSON.stringify([], null, 2));
+        }
+        try { return JSON.parse(fs.readFileSync(LEDGER_FILE, 'utf8')); }
+        catch { return []; }
+    },
+    _write(d) { fs.writeFileSync(LEDGER_FILE, JSON.stringify(d, null, 2)); },
+    async append(entry) {
+        return withLock('ledger', async () => {
+            const db = this._read();
+            db.push({ ...entry, at: new Date().toISOString() });
+            if (db.length > 100000) db.splice(0, db.length - 100000);
+            this._write(db);
+        });
+    },
+    async exists(reference, type) {
+        return withLock('ledger', async () => {
+            const db = this._read();
+            return db.some(e => e.reference === reference && e.type === type);
+        });
+    },
+};
+
+const OrderState = {
+    _read() {
+        if (!fs.existsSync(ORDER_STATE_FILE)) {
+            fs.mkdirSync(path.dirname(ORDER_STATE_FILE), { recursive: true });
+            fs.writeFileSync(ORDER_STATE_FILE, JSON.stringify({}, null, 2));
+        }
+        try { return JSON.parse(fs.readFileSync(ORDER_STATE_FILE, 'utf8')); }
+        catch { return {}; }
+    },
+    _write(d) { fs.writeFileSync(ORDER_STATE_FILE, JSON.stringify(d, null, 2)); },
+    genId() { return 'ORD' + Date.now().toString(36).toUpperCase() + crypto.randomBytes(3).toString('hex').toUpperCase(); },
+    async create(orderId, data) {
+        return withLock('order_state', async () => {
+            const db = this._read();
+            db[orderId] = {
+                orderId,
+                status: 'CREATED',
+                attempts: 0,
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                ...data,
+            };
+            this._write(db);
+            return db[orderId];
+        });
+    },
+    async get(orderId) {
+        return withLock('order_state', async () => this._read()[orderId] || null);
+    },
+    async update(orderId, patch) {
+        return withLock('order_state', async () => {
+            const db = this._read();
+            if (!db[orderId]) return null;
+            db[orderId] = { ...db[orderId], ...patch, updatedAt: new Date().toISOString() };
+            this._write(db);
+            return db[orderId];
+        });
+    },
+    async findStuck(minutes) {
+        return withLock('order_state', async () => {
+            const db = this._read();
+            const cutoff = Date.now() - minutes * 60 * 1000;
+            return Object.values(db).filter(o =>
+                ['PAYMENT_PENDING', 'PAYMENT_CONFIRMED', 'PURCHASING', 'DELIVERY_PENDING'].includes(o.status) &&
+                new Date(o.updatedAt).getTime() < cutoff
+            );
+        });
+    },
+    async recent(limit = 20) {
+        return withLock('order_state', async () => {
+            const db = this._read();
+            return Object.values(db)
+                .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
+                .slice(0, limit);
+        });
+    },
+};
+
 const DB = (() => {
     const jsonAdapter = {
         _read() {
@@ -681,12 +820,41 @@ const DB = (() => {
                 this._write(db); return db.users[id];
             });
         },
+        async addBalanceAtomic(tid, amount, type, reference, extra = {}) {
+            return withLock('json:db', async () => {
+                const db = this._read();
+                const id = String(tid);
+                if (!db.users[id]) return null;
+
+                const dup = db.ledger?.some?.(e => e.reference === reference && e.type === type);
+                if (dup) return { duplicated: true, user: db.users[id] };
+
+                const oldBalance = db.users[id].balance || 0;
+                const newBalance = oldBalance + Math.round(amount);
+                db.users[id].balance = newBalance;
+
+                db.ledger = db.ledger || [];
+                db.ledger.push({
+                    telegramId: id,
+                    amount: Math.round(amount),
+                    balanceAfter: newBalance,
+                    type,
+                    reference,
+                    metadata: extra,
+                    at: new Date().toISOString(),
+                });
+
+                this._write(db);
+                return { user: db.users[id], balance: newBalance };
+            });
+        },
         async addBalance(tid, amt, alsoCountTopup = false) {
             return withLock('json:db', async () => {
                 const db = this._read(); const id = String(tid);
                 if (!db.users[id]) return null;
-                db.users[id].balance = (db.users[id].balance || 0) + amt;
-                if (alsoCountTopup) db.users[id].totalIn = (db.users[id].totalIn || 0) + amt;
+                const delta = Math.round(amt);
+                db.users[id].balance = (db.users[id].balance || 0) + delta;
+                if (alsoCountTopup) db.users[id].totalIn = (db.users[id].totalIn || 0) + delta;
                 this._write(db); return db.users[id];
             });
         },
@@ -694,7 +862,7 @@ const DB = (() => {
             return withLock('json:db', async () => {
                 const db = this._read(); const id = String(tid);
                 if (!db.users[id]) return null;
-                db.users[id].totalIn = (db.users[id].totalIn || 0) + amt;
+                db.users[id].totalIn = (db.users[id].totalIn || 0) + Math.round(amt);
                 this._write(db); return db.users[id];
             });
         },
@@ -702,7 +870,7 @@ const DB = (() => {
             return withLock('json:db', async () => {
                 const db = this._read(); const id = String(tid);
                 if (!db.users[id] || db.users[id].balance < amt) return null;
-                db.users[id].balance -= amt;
+                db.users[id].balance -= Math.round(amt);
                 this._write(db); return db.users[id];
             });
         },
@@ -714,7 +882,7 @@ const DB = (() => {
                 const rec = { ...order, createdAt: new Date().toISOString() };
                 db.users[id].orders.unshift(rec);
                 if (order.profit) {
-                    db.users[id].profit = (db.users[id].profit || 0) + Number(order.profit);
+                    db.users[id].profit = (db.users[id].profit || 0) + Math.round(order.profit);
                 }
                 this._write(db); return rec;
             });
@@ -732,8 +900,10 @@ const DB = (() => {
         async markDepositProcessed(ref, info) {
             return withLock('json:db', async () => {
                 const db = this._read();
+                if (db.deposits[ref]) return { duplicated: true };
                 db.deposits[ref] = { ...info, at: new Date().toISOString() };
                 this._write(db);
+                return { ok: true };
             });
         },
         async findUserByDepositCode(code) {
@@ -796,37 +966,80 @@ const DB = (() => {
                         name VARCHAR(255),
                         username VARCHAR(255),
                         lang VARCHAR(10) DEFAULT 'vi',
-                        balance DOUBLE DEFAULT 0,
-                        total_in DOUBLE DEFAULT 0,
-                        profit DOUBLE DEFAULT 0,
+                        balance BIGINT DEFAULT 0,
+                        total_in BIGINT DEFAULT 0,
+                        profit BIGINT DEFAULT 0,
                         deposit_code VARCHAR(50),
                         banned BOOLEAN DEFAULT FALSE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_deposit_code (deposit_code)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 `);
                 await pool.query(`
                     CREATE TABLE IF NOT EXISTS orders (
                         id INT AUTO_INCREMENT PRIMARY KEY,
-                        telegram_id VARCHAR(50),
-                        order_id VARCHAR(100),
+                        telegram_id VARCHAR(50) NOT NULL,
+                        order_id VARCHAR(100) NOT NULL,
                         product_name VARCHAR(255),
-                        price DOUBLE DEFAULT 0,
+                        price BIGINT DEFAULT 0,
+                        base_price BIGINT DEFAULT 0,
+                        discount BIGINT DEFAULT 0,
                         quantity INT DEFAULT 1,
                         username TEXT,
                         password TEXT,
                         status VARCHAR(50),
-                        profit DOUBLE DEFAULT 0,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
+                        profit BIGINT DEFAULT 0,
+                        coupon_code VARCHAR(50),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY uk_order_id (order_id),
+                        INDEX idx_user_time (telegram_id, created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 `);
                 await pool.query(`
                     CREATE TABLE IF NOT EXISTS deposits (
                         ref VARCHAR(100) PRIMARY KEY,
-                        amount DOUBLE DEFAULT 0,
+                        amount BIGINT DEFAULT 0,
                         description TEXT,
                         telegram_id VARCHAR(50),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_user (telegram_id),
+                        INDEX idx_created (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                `);
+                await pool.query(`
+                    CREATE TABLE IF NOT EXISTS wallet_ledger (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        telegram_id VARCHAR(50) NOT NULL,
+                        amount BIGINT NOT NULL,
+                        balance_after BIGINT NOT NULL,
+                        type VARCHAR(30) NOT NULL,
+                        reference VARCHAR(150) NOT NULL,
+                        metadata JSON,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY uk_ref_type (reference, type),
+                        INDEX idx_user_time (telegram_id, created_at),
+                        INDEX idx_type_time (type, created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                `);
+                await pool.query(`
+                    CREATE TABLE IF NOT EXISTS order_state (
+                        order_id VARCHAR(100) PRIMARY KEY,
+                        telegram_id VARCHAR(50) NOT NULL,
+                        product_id VARCHAR(100),
+                        product_name VARCHAR(255),
+                        status VARCHAR(30) NOT NULL DEFAULT 'CREATED',
+                        quantity INT DEFAULT 1,
+                        price BIGINT DEFAULT 0,
+                        base_price BIGINT DEFAULT 0,
+                        profit BIGINT DEFAULT 0,
+                        attempts INT DEFAULT 0,
+                        last_error TEXT,
+                        snapshot JSON,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_status_time (status, updated_at),
+                        INDEX idx_user (telegram_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 `);
                 console.log('[DB] MySQL tables created/verified via --addsql');
                 process.exit(0);
@@ -857,33 +1070,76 @@ const DB = (() => {
             await pool.query(`UPDATE users SET ${fields} WHERE telegram_id=?`, vals);
             return this.getUser(tid);
         },
+        async addBalanceAtomic(tid, amount, type, reference, extra = {}) {
+            const id = String(tid);
+            const delta = Math.round(amount);
+            const conn = await pool.getConnection();
+            try {
+                await conn.beginTransaction();
+
+                const [ins] = await conn.query(
+                    `INSERT IGNORE INTO wallet_ledger (telegram_id, amount, balance_after, type, reference, metadata)
+                     VALUES (?, ?, 0, ?, ?, ?)`,
+                    [id, delta, type, reference, JSON.stringify(extra || {})]
+                );
+
+                if (ins.affectedRows === 0) {
+                    await conn.rollback();
+                    return { duplicated: true };
+                }
+
+                await conn.query(
+                    `UPDATE users SET balance = balance + ? WHERE telegram_id = ?`,
+                    [delta, id]
+                );
+
+                const [[u]] = await conn.query(
+                    `SELECT balance FROM users WHERE telegram_id = ?`, [id]
+                );
+
+                await conn.query(
+                    `UPDATE wallet_ledger SET balance_after = ? WHERE reference = ? AND type = ?`,
+                    [u.balance, reference, type]
+                );
+
+                await conn.commit();
+                return { balance: Number(u.balance) };
+            } catch (e) {
+                await conn.rollback();
+                throw e;
+            } finally {
+                conn.release();
+            }
+        },
         async addBalance(tid, amt, alsoCountTopup = false) {
             if (alsoCountTopup) {
-                await pool.query('UPDATE users SET balance=balance+?, total_in=total_in+? WHERE telegram_id=?', [amt, amt, String(tid)]);
+                await pool.query('UPDATE users SET balance=balance+?, total_in=total_in+? WHERE telegram_id=?', [Math.round(amt), Math.round(amt), String(tid)]);
             } else {
-                await pool.query('UPDATE users SET balance=balance+? WHERE telegram_id=?', [amt, String(tid)]);
+                await pool.query('UPDATE users SET balance=balance+? WHERE telegram_id=?', [Math.round(amt), String(tid)]);
             }
             return this.getUser(tid);
         },
         async addTotalIn(tid, amt) {
-            await pool.query('UPDATE users SET total_in=total_in+? WHERE telegram_id=?', [amt, String(tid)]);
+            await pool.query('UPDATE users SET total_in=total_in+? WHERE telegram_id=?', [Math.round(amt), String(tid)]);
             return this.getUser(tid);
         },
         async subBalance(tid, amt) {
             const [r] = await pool.query(
                 'UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?',
-                [amt, String(tid), amt]
+                [Math.round(amt), String(tid), Math.round(amt)]
             );
             return r.affectedRows ? this.getUser(tid) : null;
         },
         async addOrder(tid, o) {
             await pool.query(
-                `INSERT INTO orders (telegram_id,order_id,product_name,price,quantity,username,password,status,profit)
-         VALUES (?,?,?,?,?,?,?,?,?)`,
-                [String(tid), o.orderId, o.productName, o.price, o.quantity, o.username, o.password, o.status || 'success', o.profit || 0]
+                `INSERT INTO orders (telegram_id,order_id,product_name,price,base_price,discount,quantity,username,password,status,profit,coupon_code)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+                [String(tid), o.orderId, o.productName, Math.round(o.price || 0), Math.round(o.basePrice || 0),
+                 Math.round(o.discount || 0), o.quantity || 1, o.username, o.password,
+                 o.status || 'success', Math.round(o.profit || 0), o.couponCode || null]
             );
             if (o.profit) {
-                await pool.query('UPDATE users SET profit=profit+? WHERE telegram_id=?', [o.profit, String(tid)]);
+                await pool.query('UPDATE users SET profit=profit+? WHERE telegram_id=?', [Math.round(o.profit), String(tid)]);
             }
             return o;
         },
@@ -892,9 +1148,9 @@ const DB = (() => {
                 'SELECT * FROM orders WHERE telegram_id=? ORDER BY id DESC LIMIT 10', [String(tid)]
             );
             return r.map((x) => ({
-                orderId: x.order_id, productName: x.product_name, price: x.price,
+                orderId: x.order_id, productName: x.product_name, price: Number(x.price),
                 quantity: x.quantity, username: x.username, password: x.password,
-                status: x.status, profit: x.profit, createdAt: x.created_at,
+                status: x.status, profit: Number(x.profit), createdAt: x.created_at,
             }));
         },
         async isDepositProcessed(ref) {
@@ -902,10 +1158,11 @@ const DB = (() => {
             return r.length > 0;
         },
         async markDepositProcessed(ref, info) {
-            await pool.query(
+            const [r] = await pool.query(
                 'INSERT IGNORE INTO deposits (ref,amount,description,telegram_id) VALUES (?,?,?,?)',
-                [ref, info.amount, info.description, info.telegramId || null]
+                [ref, Math.round(info.amount || 0), info.description, info.telegramId || null]
             );
+            return r.affectedRows ? { ok: true } : { duplicated: true };
         },
         async findUserByDepositCode(code) {
             const [r] = await pool.query('SELECT * FROM users WHERE deposit_code=?', [code]);
@@ -927,14 +1184,14 @@ const DB = (() => {
         async listAllOrders(limit = 20) {
             const [r] = await pool.query(
                 `SELECT o.*, u.name AS userName FROM orders o
-         LEFT JOIN users u ON u.telegram_id = o.telegram_id
-         ORDER BY o.id DESC LIMIT ?`, [limit]
+                 LEFT JOIN users u ON u.telegram_id = o.telegram_id
+                 ORDER BY o.id DESC LIMIT ?`, [limit]
             );
             return r.map((x) => ({
                 telegramId: x.telegram_id, userName: x.userName,
-                orderId: x.order_id, productName: x.product_name, price: x.price,
+                orderId: x.order_id, productName: x.product_name, price: Number(x.price),
                 quantity: x.quantity, username: x.username, status: x.status,
-                profit: x.profit, createdAt: x.created_at,
+                profit: Number(x.profit), createdAt: x.created_at,
             }));
         },
     };
@@ -944,13 +1201,13 @@ const DB = (() => {
 
 const Pending = {
     _key: (code) => `pending:${code}`,
-    _indexKey: 'pending:index',
     _codePrefix: 'pending:code:',
 
     async create({ code, telegramId, productId, productName, amount, basePrice, profit, quantity = 1, couponCode = null }) {
         const data = {
             code, telegramId: String(telegramId), productId, productName,
-            amount, basePrice, profit, quantity, couponCode,
+            amount: Math.round(amount), basePrice: Math.round(basePrice || 0),
+            profit: Math.round(profit || 0), quantity, couponCode,
             status: 'pending', createdAt: new Date().toISOString(),
         };
         await R.setJSON(this._key(code), data, CFG.PENDING_TTL_MIN * 60 + 3600);
@@ -1021,9 +1278,14 @@ const ShopAPI = {
     async getProducts() {
         const cached = this._cacheGet('products');
         if (cached) return cached;
-        const res = (await this.client.get('/api/v1/products')).data.products || [];
-        this._cacheSet('products', res);
-        return res;
+        try {
+            const res = (await this.client.get('/api/v1/products')).data.products || [];
+            this._cacheSet('products', res);
+            return res;
+        } catch (e) {
+            if (e.response) throw new AppError(ErrorCodes.SHOP_API_ERROR, e.response?.data?.error || 'Shop API error');
+            throw new AppError(ErrorCodes.NETWORK_ERROR, e.message);
+        }
     },
     async getCategories() {
         const cached = this._cacheGet('categories');
@@ -1081,15 +1343,30 @@ const ShopAPI = {
     async purchase(productId, quantity = 1, couponCode = null) {
         const body = { productId, quantity };
         if (couponCode) body.couponCode = couponCode;
-        return (await this.client.post('/api/v1/purchases', body)).data;
+        try {
+            return (await this.client.post('/api/v1/purchases', body)).data;
+        } catch (e) {
+            if (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT') {
+                throw new AppError(ErrorCodes.SHOP_API_ERROR, 'PURCHASE_TIMEOUT');
+            }
+            if (e.response) {
+                return { success: false, error: e.response?.data?.error || 'Shop API error' };
+            }
+            throw new AppError(ErrorCodes.NETWORK_ERROR, e.message);
+        }
     },
 };
 
 const Bank = {
     async fetch() {
-        const { data } = await axios.get(CFG.BANK_API_URL, { timeout: 15000 });
-        if (data.code !== '00') throw new Error('Bank error: ' + data.des);
-        return data.transactions || [];
+        try {
+            const { data } = await axios.get(CFG.BANK_API_URL, { timeout: 15000 });
+            if (data.code !== '00') throw new AppError(ErrorCodes.NETWORK_ERROR, 'Bank API error: ' + data.des);
+            return data.transactions || [];
+        } catch (e) {
+            if (e instanceof AppError) throw e;
+            throw new AppError(ErrorCodes.NETWORK_ERROR, e.message);
+        }
     },
     parseAmount(s) { return Number(String(s).replace(/[^\d]/g, '')) || 0; },
     extractCode(desc) {
@@ -1122,7 +1399,6 @@ const Deposit = {
         for (const tx of txs) {
             if (tx.CD !== '+') continue;
             const ref = tx.Reference || `${tx.TransactionDate}-${tx.PCTime}-${tx.Amount}`;
-            if (await DB.isDepositProcessed(ref)) continue;
             const amount = Bank.parseAmount(tx.Amount);
             if (amount <= 0) continue;
             const desc = String(tx.Description || '');
@@ -1131,17 +1407,28 @@ const Deposit = {
             if (payCode) {
                 const order = await Pending.get(payCode);
                 if (order && order.status === 'pending') {
-                    if (amount >= order.amount) {
-                        await DB.markDepositProcessed(ref, {
-                            amount, description: desc, telegramId: order.telegramId, type: 'PAY', code: payCode,
-                        });
-                        await Pending.update(payCode, { status: 'paid', paidAmount: amount, ref });
-                        if (onCredit) await onCredit({ type: 'pay', telegramId: order.telegramId, amount, order });
-                    } else {
-                        await DB.markDepositProcessed(ref, {
-                            amount, description: desc, telegramId: order.telegramId, type: 'PAY_SHORT', code: payCode,
-                        });
-                        if (onCredit) await onCredit({ type: 'pay_short', telegramId: order.telegramId, amount, order });
+                    const lockOk = await StateStore.acquireDepositLock(`pay:${ref}`);
+                    if (!lockOk) continue;
+                    try {
+                        const already = await DB.isDepositProcessed(ref);
+                        if (already) continue;
+
+                        if (amount >= order.amount) {
+                            const res = await DB.markDepositProcessed(ref, {
+                                amount, description: desc, telegramId: order.telegramId, type: 'PAY', code: payCode,
+                            });
+                            if (res.duplicated) continue;
+                            await Pending.update(payCode, { status: 'paid', paidAmount: amount, ref });
+                            if (onCredit) await onCredit({ type: 'pay', telegramId: order.telegramId, amount, order });
+                        } else {
+                            const res = await DB.markDepositProcessed(ref, {
+                                amount, description: desc, telegramId: order.telegramId, type: 'PAY_SHORT', code: payCode,
+                            });
+                            if (res.duplicated) continue;
+                            if (onCredit) await onCredit({ type: 'pay_short', telegramId: order.telegramId, amount, order });
+                        }
+                    } finally {
+                        await StateStore.releaseDepositLock(`pay:${ref}`);
                     }
                     continue;
                 }
@@ -1152,13 +1439,30 @@ const Deposit = {
             const user = await DB.findUserByDepositCode(code);
             if (!user) continue;
 
-            await DB.addBalance(user.telegramId, amount, true);
-            await DB.markDepositProcessed(ref, {
-                amount, description: desc, telegramId: user.telegramId, type: 'NAP',
-            });
-            await DB.setDepositCode(user.telegramId, Bank.genCode());
-            console.log(`[Deposit] +${amount} -> ${user.telegramId}`);
-            if (onCredit) await onCredit({ type: 'deposit', telegramId: user.telegramId, amount });
+            const lockOk = await StateStore.acquireDepositLock(ref);
+            if (!lockOk) continue;
+            try {
+                const already = await DB.isDepositProcessed(ref);
+                if (already) continue;
+
+                const markRes = await DB.markDepositProcessed(ref, {
+                    amount, description: desc, telegramId: user.telegramId, type: 'NAP',
+                });
+                if (markRes.duplicated) continue;
+
+                const creditRes = await DB.addBalanceAtomic(user.telegramId, amount, 'DEPOSIT', ref, {
+                    bankTx: ref, description: desc,
+                });
+                if (creditRes.duplicated) continue;
+
+                await DB.addTotalIn(user.telegramId, amount);
+                await DB.setDepositCode(user.telegramId, Bank.genCode());
+
+                console.log(`[Deposit] +${amount} -> ${user.telegramId}`);
+                if (onCredit) await onCredit({ type: 'deposit', telegramId: user.telegramId, amount });
+            } finally {
+                await StateStore.releaseDepositLock(ref);
+            }
         }
     },
 };
@@ -1214,21 +1518,32 @@ const api = axios.create({
     timeout: 30000,
 });
 
-async function tgCall(method, payload) {
-    try {
-        const { data } = await api.post(`/${method}`, payload);
-        return data.result;
-    } catch (e) {
-        const desc = e.response?.data?.description || e.message;
-        throw new Error(desc);
+async function tgCall(method, payload, retries = 3) {
+    for (let attempt = 0; attempt < retries; attempt++) {
+        try {
+            const { data } = await api.post(`/${method}`, payload);
+            return data.result;
+        } catch (e) {
+            const status = e.response?.status;
+            const retryAfter = e.response?.data?.parameters?.retry_after;
+
+            if (status === 429 && retryAfter && attempt < retries - 1) {
+                await new Promise(r => setTimeout(r, retryAfter * 1000 + 500));
+                continue;
+            }
+            if (status >= 500 && attempt < retries - 1) {
+                await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+                continue;
+            }
+            const desc = e.response?.data?.description || e.message;
+            throw new AppError(ErrorCodes.TELEGRAM_ERROR, desc);
+        }
     }
+    throw new AppError(ErrorCodes.TELEGRAM_ERROR, `Max retries for ${method}`);
 }
 
 async function sendMessageRaw(chatId, text, options = {}) {
     const payload = { chat_id: chatId, text, ...options };
-    if (options.parse_mode && !options._disableHtml) {
-        payload.parse_mode = 'HTML';
-    }
     return tgCall('sendMessage', payload);
 }
 
@@ -1254,8 +1569,7 @@ async function sendPhotoRaw(chatId, photo, options = {}) {
         const { data } = await api.post('/sendPhoto', fd, { headers: fd.getHeaders() });
         return data.result;
     } catch (e) {
-        const desc = e.response?.data?.description || e.message;
-        throw new Error(desc);
+        throw new AppError(ErrorCodes.TELEGRAM_ERROR, e.response?.data?.description || e.message);
     }
 }
 
@@ -1272,8 +1586,7 @@ async function sendDocumentRaw(chatId, filePath, options = {}) {
         const { data } = await api.post('/sendDocument', fd, { headers: fd.getHeaders() });
         return data.result;
     } catch (e) {
-        const desc = e.response?.data?.description || e.message;
-        throw new Error(desc);
+        throw new AppError(ErrorCodes.TELEGRAM_ERROR, e.response?.data?.description || e.message);
     }
 }
 
@@ -1290,16 +1603,12 @@ async function sendDocumentBufferRaw(chatId, buffer, filename, options = {}) {
         const { data } = await api.post('/sendDocument', fd, { headers: fd.getHeaders() });
         return data.result;
     } catch (e) {
-        const desc = e.response?.data?.description || e.message;
-        throw new Error(desc);
+        throw new AppError(ErrorCodes.TELEGRAM_ERROR, e.response?.data?.description || e.message);
     }
 }
 
 let scanRequested = false;
-
-function requestBankScan() {
-    scanRequested = true;
-}
+function requestBankScan() { scanRequested = true; }
 
 async function cleanOldMessages(chatId, userId, keep = 0) {
     if (!CFG.AUTO_CLEAN) return;
@@ -1329,7 +1638,7 @@ async function cleanAll(chatId, userId) {
     await StateStore.clearTracked(chatId, userId);
 }
 
-function money(n) { return Number(n).toLocaleString('vi-VN') + 'đ'; }
+function money(n) { return Number(Math.round(n)).toLocaleString('vi-VN') + 'đ'; }
 
 function getRank(totalIn) {
     const n = Number(totalIn || 0);
@@ -1372,8 +1681,7 @@ async function send(chatId, text, options = {}, cleanOpt = {}) {
 
     if (editMessageId) {
         try {
-            const edited = await editMessageRaw(chatId, editMessageId, s, finalOpts);
-            return edited;
+            return await editMessageRaw(chatId, editMessageId, s, finalOpts);
         } catch (e) {
         }
     }
@@ -1391,8 +1699,7 @@ async function safeSend(chatId, text, options = {}, cleanOpt = {}) {
 
     if (editMessageId) {
         try {
-            const edited = await editMessageRaw(chatId, editMessageId, text, opts);
-            return edited;
+            return await editMessageRaw(chatId, editMessageId, text, opts);
         } catch (e) {
         }
     }
@@ -1416,7 +1723,6 @@ async function safeSend(chatId, text, options = {}, cleanOpt = {}) {
         if (msg.includes('tg-emoji') || msg.includes('custom emoji') ||
             msg.includes('ENTITY_TEXT_INVALID')) {
             PREMIUM_OK = false;
-            console.log('[Premium] Auto-OFF:', msg);
         }
 
         try {
@@ -1434,7 +1740,6 @@ async function safeSend(chatId, text, options = {}, cleanOpt = {}) {
         const hasRaw = sent.text.includes('<tg-emoji') || sent.text.includes('emoji-id=');
         if (hasRaw) {
             PREMIUM_OK = false;
-            console.log('[Premium] Detect raw → TẮT');
             try { await bot.deleteMessage(chatId, sent.message_id); } catch { }
             const cleaned = stripPremiumEmoji(text);
             sent = await sendMessageRaw(chatId, cleaned, opts);
@@ -1499,12 +1804,11 @@ async function sendQR(chatId, userId, { amount, addInfo, caption }) {
     try {
         const buffer = await VietQR.toBuffer({
             bankBin: bin, account: CFG.BANK_ACCOUNT,
-            amount, addInfo, holder: CFG.BANK_HOLDER,
+            amount: Math.round(amount || 0), addInfo, holder: CFG.BANK_HOLDER,
         });
         await sendPhotoSafe(chatId, buffer, { caption, parse_mode: 'HTML' }, { userId });
         return true;
     } catch (e) {
-        console.error('[sendQR]', e);
         await send(chatId,
             `${P('warn')} Không tạo được QR: ${escapeHtml(e.message)}\n\n` +
             `${P('plus')} Chuyển khoản thủ công:\n${P('plus')} ${CFG.BANK_NAME}\n${P('balance')} <code>${CFG.BANK_ACCOUNT}</code>\n${P('id_card')} ${CFG.BANK_HOLDER}\n${P('pin')} <code>${addInfo}</code>${amount ? `\n${P('balance')} <b>${money(amount)}</b>` : ''}`,
@@ -1536,13 +1840,11 @@ async function sendApiDocs(chatId, userId, headerText) {
             const plainCaption = stripPremiumEmoji(
                 `${P('mail')} <b>Tài liệu tích hợp API</b>\n${API_DOC_FILENAME}`
             ).replace(/<[^>]+>/g, '');
-
             sent = await sendDocumentRaw(chatId, API_DOC_PATH, { caption: plainCaption });
         }
 
         if (userId && sent) await trackMessage(chatId, userId, sent);
     } catch (e) {
-        console.error('[sendApiDocs]', e);
         await send(chatId, `${P('fail')} Không gửi được file.`, {}, { userId });
     }
 }
@@ -1584,6 +1886,54 @@ function notifyAdmins(text) {
     ADMIN_IDS.forEach((id) => {
         sendMessageRaw(id, text, { parse_mode: 'HTML' }).catch(() => { });
     });
+}
+
+async function executePurchaseWithRecovery(internalOrderId, productId, quantity, couponCode) {
+    const state = await OrderState.get(internalOrderId);
+    if (!state) throw new AppError(ErrorCodes.VALIDATION_ERROR, 'Order not found');
+    if (state.status === 'PURCHASE_SUCCESS') return state.snapshot;
+    if (state.status === 'PURCHASE_UNKNOWN') {
+        throw new AppError(ErrorCodes.SHOP_API_ERROR, 'PURCHASE_UNKNOWN');
+    }
+
+    await OrderState.update(internalOrderId, {
+        status: 'PURCHASING',
+        attempts: (state.attempts || 0) + 1,
+    });
+
+    let res;
+    try {
+        res = await ShopAPI.purchase(productId, quantity, couponCode);
+    } catch (e) {
+        if (e.message === 'PURCHASE_TIMEOUT' || e.code === ErrorCodes.SHOP_API_ERROR) {
+            await OrderState.update(internalOrderId, { status: 'PURCHASE_UNKNOWN', last_error: e.message });
+            notifyAdmins(
+                `${P('warn')} <b>PURCHASE UNKNOWN</b>\nOrder: <code>${internalOrderId}</code>\n` +
+                `Cần kiểm tra thủ công để tránh double purchase.`
+            );
+            throw new AppError(ErrorCodes.SHOP_API_ERROR, 'PURCHASE_UNKNOWN');
+        }
+        await OrderState.update(internalOrderId, { status: 'PURCHASE_FAILED', last_error: e.message });
+        throw e;
+    }
+
+    if (!res.success) {
+        await OrderState.update(internalOrderId, {
+            status: 'PURCHASE_FAILED',
+            last_error: res.error || 'unknown',
+        });
+        return res;
+    }
+
+    await OrderState.update(internalOrderId, {
+        status: 'PURCHASE_SUCCESS',
+        snapshot: {
+            orderId: res.orderId, productName: res.productName,
+            username: res.username, password: res.password,
+            pricePaid: res.pricePaid,
+        },
+    });
+    return res;
 }
 
 const H = {
@@ -1829,6 +2179,10 @@ const H = {
             const p = list.find((x) => x.id === productId);
             if (!p) return send(chatId, t(user.lang, 'product_not_found'), {}, { userId });
 
+            const fresh = await DB.getUser(userId);
+            if (!fresh) return send(chatId, `${P('fail')} Không tìm thấy user.`, {}, { userId });
+            if (fresh.banned) return send(chatId, t(user.lang, 'banned'), {}, { userId });
+
             if (p.isApiProduct === false && p.stock !== undefined && p.stock <= 0) {
                 return send(chatId, `${P('fail')} Sản phẩm này đã hết hàng.`, {}, { userId });
             }
@@ -1895,12 +2249,18 @@ const H = {
     },
 
     async doPurchase(chatId, userId, user, productId, couponCode = null, quantity = 1) {
+        const lockToken = await StateStore.acquireBuyLock(userId, productId);
+        if (!lockToken) {
+            return send(chatId, t(user.lang, 'buy_processing'), {}, { userId });
+        }
+
+        let internalOrderId = null;
         try {
             const list = await ShopAPI.getProducts();
             const p = list.find((x) => x.id === productId);
             if (!p) return send(chatId, t(user.lang, 'product_not_found'), {}, { userId });
 
-            const basePrice = Number(p.salePrice || p.price) * quantity;
+            const basePrice = Math.round(Number(p.salePrice || p.price) * quantity);
             const priceInfo = calcPrice(basePrice);
             let finalPrice = priceInfo.final;
 
@@ -1929,53 +2289,90 @@ const H = {
                     }, { userId });
             }
 
-            await this._doPurchaseWithBalance(chatId, userId, user, productId, priceInfo, finalPrice, couponCode, quantity);
-        } catch (e) {
-            await send(chatId, t(user.lang, 'buy_fail', escapeHtml(e.message)), {}, { userId });
-        }
-    },
+            internalOrderId = OrderState.genId();
+            await OrderState.create(internalOrderId, {
+                telegramId: userId, productId,
+                productName: p.name, quantity,
+                price: finalPrice, basePrice: priceInfo.base, profit: priceInfo.discount,
+                couponCode,
+                snapshot: {
+                    productName: p.name, price: finalPrice,
+                    basePrice: priceInfo.base, discount: priceInfo.discount,
+                    quantity, couponCode,
+                },
+            });
 
-    async _doPurchaseWithBalance(chatId, userId, user, productId, priceInfo, finalPrice, couponCode = null, quantity = 1) {
-        const { base, discount } = priceInfo;
-        const debited = await DB.subBalance(userId, finalPrice);
-        if (!debited) return send(chatId, t(user.lang, 'buy_fail', 'Không đủ số dư.'), {}, { userId });
-
-        const res = await ShopAPI.purchase(productId, quantity, couponCode);
-        if (!res.success) {
-            await DB.addBalance(userId, finalPrice);
-            if (String(res.error || '').toLowerCase().includes('giảm giá') ||
-                String(res.error || '').toLowerCase().includes('coupon')) {
-                return send(chatId, `${P('fail')} ${escapeHtml(res.error)}\n\nThử lại không dùng mã?`, {
-                    reply_markup: {
-                        inline_keyboard: [[
-                            { text: t(user.lang, 'btn_buy_no_code'), callback_data: `confirm:${productId}` },
-                            { text: t(user.lang, 'cancel'), callback_data: 'menu:main' },
-                        ]]
-                    },
-                }, { userId });
+            const debited = await DB.subBalance(userId, finalPrice);
+            if (!debited) {
+                await OrderState.update(internalOrderId, { status: 'CANCELLED', last_error: 'insufficient_balance' });
+                return send(chatId, t(user.lang, 'buy_fail', 'Không đủ số dư.'), {}, { userId });
             }
-            return send(chatId, t(user.lang, 'buy_fail', escapeHtml(res.error || 'unknown')), {}, { userId });
+
+            await DB.addBalanceAtomic(userId, -finalPrice, 'PURCHASE', internalOrderId, {
+                productId, productName: p.name, quantity,
+            });
+
+            await OrderState.update(internalOrderId, { status: 'PAYMENT_CONFIRMED' });
+
+            let res;
+            try {
+                res = await executePurchaseWithRecovery(internalOrderId, productId, quantity, couponCode);
+            } catch (e) {
+                await DB.addBalanceAtomic(userId, finalPrice, 'REFUND', `refund:${internalOrderId}`, {
+                    reason: e.message, orderId: internalOrderId,
+                });
+                await DB.addBalance(userId, finalPrice);
+                await OrderState.update(internalOrderId, { status: 'REFUNDED', last_error: e.message });
+                return send(chatId, t(user.lang, 'buy_fail', 'Đơn lỗi, đã hoàn tiền vào số dư.'), {}, { userId });
+            }
+
+            if (!res.success) {
+                await DB.addBalanceAtomic(userId, finalPrice, 'REFUND', `refund:${internalOrderId}`, {
+                    reason: res.error, orderId: internalOrderId,
+                });
+                await DB.addBalance(userId, finalPrice);
+                await OrderState.update(internalOrderId, { status: 'REFUNDED', last_error: res.error });
+                if (String(res.error || '').toLowerCase().includes('giảm giá') ||
+                    String(res.error || '').toLowerCase().includes('coupon')) {
+                    return send(chatId, `${P('fail')} ${escapeHtml(res.error)}\n\nThử lại không dùng mã?`, {
+                        reply_markup: {
+                            inline_keyboard: [[
+                                { text: t(user.lang, 'btn_buy_no_code'), callback_data: `confirm:${productId}` },
+                                { text: t(user.lang, 'cancel'), callback_data: 'menu:main' },
+                            ]]
+                        },
+                    }, { userId });
+                }
+                return send(chatId, t(user.lang, 'buy_fail', escapeHtml(res.error || 'unknown')), {}, { userId });
+            }
+
+            await DB.addOrder(userId, {
+                orderId: res.orderId, productName: res.productName,
+                price: finalPrice, basePrice: priceInfo.base, profit: priceInfo.discount,
+                quantity, username: res.username, password: res.password,
+                status: 'success', via: 'balance',
+                couponCode: couponCode || null,
+            });
+
+            await OrderState.update(internalOrderId, { status: 'DELIVERED', shopOrderId: res.orderId });
+
+            await cleanOldMessages(chatId, userId, 0);
+            await deliverAccount(chatId, userId, user, res);
+
+            notifyAdmins(
+                `${P('order2')} <b>ĐƠN MỚI (balance)</b>\n` +
+                `${P('plus')} <code>${userId}</code>\n` +
+                `${P('products')} ${escapeHtml(res.productName)} (x${quantity})\n` +
+                `${P('balance')} Bán: ${money(finalPrice)}\n` +
+                `${P('total_in')} Lợi nhuận: <b>${money(priceInfo.discount)}</b>` +
+                (couponCode ? `\n${P('balance')} Coupon: <code>${escapeHtml(couponCode)}</code>` : '')
+            );
+        } catch (e) {
+            console.error('[doPurchase]', e.code || '', e.message);
+            await send(chatId, t(user.lang, 'buy_fail', escapeHtml(e.message)), {}, { userId });
+        } finally {
+            await StateStore.releaseBuyLock(userId, productId, lockToken);
         }
-
-        await DB.addOrder(userId, {
-            orderId: res.orderId, productName: res.productName,
-            price: finalPrice, basePrice: base, profit: discount,
-            quantity, username: res.username, password: res.password,
-            status: 'success', via: 'balance',
-            couponCode: couponCode || null,
-        });
-
-        await cleanOldMessages(chatId, userId, 0);
-        await deliverAccount(chatId, userId, user, res);
-
-        notifyAdmins(
-            `${P('order2')} <b>ĐƠN MỚI (balance)</b>\n` +
-            `${P('plus')} <code>${userId}</code>\n` +
-            `${P('products')} ${escapeHtml(res.productName)} (x${quantity})\n` +
-            `${P('balance')} Bán: ${money(finalPrice)}\n` +
-            `${P('total_in')} Lợi nhuận: <b>${money(discount)}</b>` +
-            (couponCode ? `\n${P('balance')} Coupon: <code>${escapeHtml(couponCode)}</code>` : '')
-        );
     },
 
     async payDirect(q, user, productId) {
@@ -1991,7 +2388,7 @@ const H = {
             if (!p) return send(chatId, t(user.lang, 'product_not_found'), {}, { userId });
 
             const qty = state.quantity || 1;
-            const basePrice = Number(p.salePrice || p.price) * qty;
+            const basePrice = Math.round(Number(p.salePrice || p.price) * qty);
             const priceInfo = calcPrice(basePrice);
             let finalPrice = priceInfo.final;
 
@@ -2002,7 +2399,7 @@ const H = {
                 }
             }
 
-            const code = Pending.genCode ? Pending.genCode() : ('PAY' + Math.random().toString(36).slice(2, 8).toUpperCase());
+            const code = 'PAY' + Math.random().toString(36).slice(2, 8).toUpperCase();
             await Pending.create({
                 code, telegramId: userId, productId,
                 productName: p.name, amount: finalPrice,
@@ -2235,16 +2632,37 @@ const A = {
                     { text: 'Users', callback_data: 'admin:users' }],
                     [{ text: 'Đơn hàng', callback_data: 'admin:orders' },
                     { text: 'Đơn chờ QR', callback_data: 'admin:pending' }],
-                    [{ text: 'Nạp thủ công', callback_data: 'admin:manualdeposit' },
-                    { text: 'Tìm user', callback_data: 'admin:finduser' }],
-                    [{ text: 'Chiết khấu', callback_data: 'admin:discount' },
-                    { text: 'Broadcast', callback_data: 'admin:broadcast' }],
-                    [{ text: 'Cấu hình', callback_data: 'admin:config' }],
+                    [{ text: 'Đơn lỗi', callback_data: 'admin:stuck' },
+                    { text: 'Nạp thủ công', callback_data: 'admin:manualdeposit' }],
+                    [{ text: 'Tìm user', callback_data: 'admin:finduser' },
+                    { text: 'Chiết khấu', callback_data: 'admin:discount' }],
+                    [{ text: 'Broadcast', callback_data: 'admin:broadcast' },
+                    { text: 'Cấu hình', callback_data: 'admin:config' }],
                     [{ text: 'Tải tài liệu API (.md)', callback_data: 'api:doc' }],
                     [{ text: 'Mở trang Developer API', url: API_INFO.docsUrl }],
                 ],
             },
         }, { userId, cleanBefore: true });
+    },
+
+    async stuck(chatId, userId) {
+        const stuck = await OrderState.findStuck(CFG.STUCK_ORDER_MIN);
+        if (!stuck.length) return send(chatId, `${P('success')} Không có đơn lỗi.`, {}, { userId });
+
+        const lines = stuck.slice(0, 15).map((o, i) => {
+            const age = Math.round((Date.now() - new Date(o.updatedAt).getTime()) / 60000);
+            return `${i + 1}. <code>${o.orderId}</code>\n` +
+                `   ${P('plus')} User: <code>${o.telegramId}</code>\n` +
+                `   ${P('products')} ${escapeHtml(o.productName || 'N/A')}\n` +
+                `   Status: <b>${o.status}</b> | Age: <b>${age} min</b>\n` +
+                `   Attempts: ${o.attempts || 0}${o.lastError ? `\n   Error: ${escapeHtml(o.lastError)}` : ''}`;
+        }).join('\n\n');
+
+        await send(chatId,
+            `${P('warn')} <b>ĐƠN LỖI (${stuck.length})</b>\n\n${lines}\n\n` +
+            `Dùng lệnh:\n<code>/refundorder ORDER_ID</code>\n<code>/completeorder ORDER_ID</code>`,
+            { reply_markup: { inline_keyboard: [[{ text: 'Quay lại', callback_data: 'admin:home', ...CE('back') }]] } },
+            { userId });
     },
 
     discountHome(chatId, userId) {
@@ -2309,6 +2727,7 @@ const A = {
     async stats(chatId, userId) {
         const s = await DB.countUsers();
         const pendings = (await Pending.all()).filter((p) => p.status === 'pending');
+        const stuck = await OrderState.findStuck(CFG.STUCK_ORDER_MIN);
         const dLabel = discountLabel();
 
         await send(chatId,
@@ -2318,6 +2737,7 @@ const A = {
             `${P('orders')} Đơn hàng: <b>${s.orders}</b>\n` +
             `${P('total_in')} Lợi nhuận: <b>${money(s.profit || 0)}</b>\n` +
             `${P('time')} Đơn QR chờ: <b>${pendings.length}</b>\n` +
+            `${P('warn')} Đơn lỗi: <b>${stuck.length}</b>\n` +
             `${P('balance')} Chiết khấu: <b>${dLabel}</b>`,
             { reply_markup: { inline_keyboard: [[{ text: 'Quay lại', callback_data: 'admin:home', ...CE('back') }]] } },
             { userId });
@@ -2342,7 +2762,7 @@ const A = {
             `${i + 1}. <b>${escapeHtml(u.name || 'NoName')}</b>${u.banned ? ' [BANNED]' : ''}\n` +
             `   ${P('plus')} <code>${u.telegramId}</code> | ${P('balance')} ${money(u.balance)} | ${P('total_in')} ${money(u.profit || 0)}`
         ).join('\n');
-        await send(chatId, `${P('plus')} <b>USERS</b>\n\n${lines || 'Trống'}`,
+        await send(chatId, `${P('plus')} <b>USERS (20 mới nhất)</b>\n\n${lines || 'Trống'}`,
             { reply_markup: { inline_keyboard: [[{ text: 'Quay lại', callback_data: 'admin:home', ...CE('back') }]] } },
             { userId });
     },
@@ -2355,7 +2775,7 @@ const A = {
             `   ${P('id_card')} ${escapeHtml(o.userName || o.telegramId)} | ${P('balance')} ${money(o.price)} | ${escapeHtml(o.status)}` +
             (o.profit ? ` | ${P('total_in')} +${money(o.profit)}` : '')
         ).join('\n\n');
-        await send(chatId, `${P('orders')} <b>ĐƠN HÀNG</b>\n\n${lines}`,
+        await send(chatId, `${P('orders')} <b>ĐƠN HÀNG (20 mới nhất)</b>\n\n${lines}`,
             { reply_markup: { inline_keyboard: [[{ text: 'Quay lại', callback_data: 'admin:home', ...CE('back') }]] } },
             { userId });
     },
@@ -2381,7 +2801,10 @@ const A = {
         const u = await DB.getUser(targetId);
         if (!u) return send(chatId, `${P('fail')} Không tìm thấy user <code>${targetId}</code>`, {}, { userId });
 
-        await DB.addBalance(targetId, amount, true);
+        const ref = `admin:${userId}:${Date.now()}`;
+        await DB.addBalanceAtomic(targetId, amount, 'ADMIN_ADD', ref, { adminId: userId });
+        await DB.addBalance(targetId, 0);
+        await DB.addTotalIn(targetId, amount);
         await StateStore.delAdmin(userId);
 
         await send(chatId,
@@ -2446,11 +2869,16 @@ const A = {
         const amount = Number(text.replace(/[^\d]/g, ''));
         if (!amount || amount <= 0) return send(chatId, `${P('fail')} Số tiền không hợp lệ.`, {}, { userId });
 
+        const ref = `admin:${userId}:${Date.now()}`;
         if (state.mode === 'add') {
-            await DB.addBalance(state.targetId, amount, true);
+            await DB.addBalanceAtomic(state.targetId, amount, 'ADMIN_ADD', ref, { adminId: userId });
+            await DB.addBalance(state.targetId, 0);
+            await DB.addTotalIn(state.targetId, amount);
         } else {
             const r = await DB.subBalance(state.targetId, amount);
             if (!r) return send(chatId, `${P('fail')} User không đủ số dư.`, {}, { userId });
+            await DB.addBalanceAtomic(state.targetId, -amount, 'ADMIN_SUB', ref, { adminId: userId });
+            await DB.addBalance(state.targetId, 0);
         }
         await StateStore.delAdmin(userId);
 
@@ -2489,7 +2917,7 @@ const A = {
                 await sendMessageRaw(u.telegramId, text, { parse_mode: 'HTML' });
                 ok++;
             } catch { fail++; }
-            await new Promise((r) => setTimeout(r, 50));
+            await new Promise((r) => setTimeout(r, 100));
         }
         await send(chatId,
             `${P('broadcast')} <b>Broadcast xong</b>\n\n${P('success')} Thành công: ${ok}\n${P('fail')} Thất bại: ${fail}`,
@@ -2553,6 +2981,50 @@ bot.onText(/\/api/, async (m) => {
     await sendApiDocs(m.chat.id, userId, `${P('mail')} <b>TÀI LIỆU API</b>`);
 });
 
+bot.onText(/\/refundorder(?:\s+(.+))?/, async (m) => {
+    if (!isAdmin(m.from.id)) return;
+    const adminId = String(m.from.id);
+    const orderId = (m[1] || '').trim();
+    if (!orderId) return send(m.chat.id, `${P('fail')} Cú pháp: /refundorder ORDER_ID`, {}, { userId: adminId });
+
+    const state = await OrderState.get(orderId);
+    if (!state) return send(m.chat.id, `${P('fail')} Không tìm thấy order.`, {}, { userId: adminId });
+    if (state.status === 'REFUNDED') return send(m.chat.id, `${P('warn')} Order đã được refund rồi.`, {}, { userId: adminId });
+
+    const ref = `refund:${orderId}`;
+    const dup = await Ledger.exists(ref, 'REFUND');
+    if (dup) return send(m.chat.id, `${P('warn')} Ledger đã có refund cho order này.`, {}, { userId: adminId });
+
+    const fresh = await DB.getUser(state.telegramId);
+    if (!fresh) return send(m.chat.id, `${P('fail')} Không tìm thấy user.`, {}, { userId: adminId });
+
+    await DB.addBalanceAtomic(state.telegramId, state.price, 'REFUND', ref, { adminId, orderId, reason: 'manual_refund' });
+    await DB.addBalance(state.telegramId, 0);
+    await OrderState.update(orderId, { status: 'REFUNDED', last_error: `manual_refund by ${adminId}` });
+
+    await send(m.chat.id,
+        `${P('success')} Đã refund <b>${money(state.price)}</b>\nOrder: <code>${orderId}</code>\nUser: <code>${state.telegramId}</code>`,
+        {}, { userId: adminId });
+
+    sendMessageRaw(state.telegramId,
+        `${P('ok')} Đơn <code>${orderId}</code> đã được hoàn <b>${money(state.price)}</b> vào số dư.`,
+        { parse_mode: 'HTML' }).catch(() => { });
+});
+
+bot.onText(/\/completeorder(?:\s+(.+))?/, async (m) => {
+    if (!isAdmin(m.from.id)) return;
+    const adminId = String(m.from.id);
+    const orderId = (m[1] || '').trim();
+    if (!orderId) return send(m.chat.id, `${P('fail')} Cú pháp: /completeorder ORDER_ID`, {}, { userId: adminId });
+
+    const state = await OrderState.get(orderId);
+    if (!state) return send(m.chat.id, `${P('fail')} Không tìm thấy order.`, {}, { userId: adminId });
+    if (state.status === 'DELIVERED') return send(m.chat.id, `${P('warn')} Order đã delivered.`, {}, { userId: adminId });
+
+    await OrderState.update(orderId, { status: 'DELIVERED', last_error: `manual_complete by ${adminId}` });
+    await send(m.chat.id, `${P('success')} Đã đánh dấu DELIVERED cho <code>${orderId}</code>`, {}, { userId: adminId });
+});
+
 const USER_COMMANDS = [
     { command: 'start', description: 'Khởi động bot' },
     { command: 'products', description: 'Sản phẩm' },
@@ -2569,6 +3041,8 @@ const ADMIN_COMMANDS = [
     ...USER_COMMANDS,
     { command: 'admin', description: 'Admin Panel' },
     { command: 'cancel', description: 'Hủy thao tác' },
+    { command: 'refundorder', description: 'Refund đơn lỗi' },
+    { command: 'completeorder', description: 'Đánh dấu đơn hoàn thành' },
 ];
 
 async function setupCommands() {
@@ -2709,16 +3183,19 @@ bot.on('callback_query', async (q) => {
 
         if (data.startsWith('coupon:skip:')) {
             const pid = data.split(':')[2];
+            const cState = (await StateStore.getCoupon(userId)) || {};
+            const qty = cState.quantity || 1;
             await StateStore.delCoupon(userId);
             await cleanOldMessages(chatId, userId, 0);
-            return H.doPurchase(chatId, userId, user, pid, null);
+            return H.doPurchase(chatId, userId, user, pid, null, qty);
         }
         if (data.startsWith('paybal:')) {
             const pid = data.split(':')[1];
             const cState = (await StateStore.getCoupon(userId)) || {};
             const coupon = cState.couponCode || null;
+            const qty = cState.quantity || 1;
             await StateStore.delCoupon(userId);
-            return H.doPurchase(chatId, userId, user, pid, coupon);
+            return H.doPurchase(chatId, userId, user, pid, coupon, qty);
         }
         if (data.startsWith('paydirect:')) return H.payDirect(q, user, data.split(':')[1]);
         if (data.startsWith('paycheck:')) return H.payCheck(q, user, data.split(':')[1]);
@@ -2734,7 +3211,7 @@ bot.on('callback_query', async (q) => {
         if (data.startsWith('cat:')) return H.products(chatId, userId, user, data.split(':')[1], q.message?.message_id);
         if (data === 'menu:search') return H.search(chatId, userId, user, q.message?.message_id);
         if (data === 'menu:account') return H.account(chatId, userId, user, q.message?.message_id);
-        if (data === 'menu:deposit') return H.deposit(chatId, userId, user, q.message?.message_id);
+        if (data === 'menu:deposit') return H.deposit(chatId, userId, user);
         if (data === 'menu:history') return H.history(chatId, userId, user, q.message?.message_id);
 
         if (data === 'api:doc') {
@@ -2749,6 +3226,7 @@ bot.on('callback_query', async (q) => {
         if (data === 'admin:users') return A.users(chatId, userId);
         if (data === 'admin:orders') return A.orders(chatId, userId);
         if (data === 'admin:pending') return A.pending(chatId, userId);
+        if (data === 'admin:stuck') return A.stuck(chatId, userId);
         if (data === 'admin:manualdeposit') return A.manualDepositPrompt(chatId, userId);
         if (data === 'admin:finduser') return A.findUserPrompt(chatId, userId);
         if (data === 'admin:broadcast') return A.broadcastPrompt(chatId, userId);
@@ -2763,7 +3241,7 @@ bot.on('callback_query', async (q) => {
         if (data.startsWith('admin:subbal:')) return A.balancePrompt(chatId, userId, 'sub', data.split(':')[2]);
         if (data.startsWith('admin:toggleban:')) return A.toggleBan(chatId, userId, data.split(':')[2]);
     } catch (e) {
-        console.error('[Callback]', e);
+        console.error('[Callback]', e.code || '', e.message);
     } finally {
         bot.answerCallbackQuery(q.id).catch(() => { });
     }
@@ -2778,35 +3256,68 @@ async function handleCredit({ type, telegramId, amount, order }) {
             await sendMessageRaw(telegramId,
                 t(u.lang, 'deposit_success', money(amount)),
                 { parse_mode: 'HTML', ...mainMenu(u.lang, isAdmin(telegramId)) });
-        } catch (e) { console.error('[Notify]', e.message); }
+        } catch (e) { console.error('[Notify]', e.code || '', e.message); }
         return;
     }
 
     if (type === 'pay') {
+        const internalOrderId = order.code;
         try {
-            const res = await ShopAPI.purchase(order.productId, order.quantity || 1, order.couponCode || null);
-            if (!res.success) {
-                await DB.addBalance(telegramId, amount, true);
+            const state = await OrderState.get(internalOrderId);
+            if (state && state.status === 'DELIVERED') return;
+
+            await OrderState.create(internalOrderId, {
+                telegramId: String(telegramId), productId: order.productId,
+                productName: order.productName,
+                quantity: order.quantity || 1,
+                price: Math.round(order.amount),
+                basePrice: Math.round(order.basePrice || 0),
+                profit: Math.round(order.profit || 0),
+                couponCode: order.couponCode || null,
+            });
+
+            let res;
+            try {
+                res = await executePurchaseWithRecovery(internalOrderId, order.productId, order.quantity || 1, order.couponCode || null);
+            } catch (e) {
+                await DB.addBalanceAtomic(telegramId, order.amount, 'REFUND', `refund:${internalOrderId}`, {
+                    reason: e.message, orderId: internalOrderId,
+                });
+                await DB.addBalance(telegramId, 0);
                 await sendMessageRaw(telegramId,
-                    `${t(u.lang, 'pay_direct_fail', escapeHtml(res.error || 'unknown'))}\n\n${P('success')} Số tiền <b>${money(amount)}</b> đã được cộng vào số dư của bạn do đơn lỗi.`,
+                    `${t(u.lang, 'pay_direct_fail', 'Đơn lỗi, đã hoàn tiền')}\n\n${P('success')} Số tiền <b>${money(order.amount)}</b> đã được cộng vào số dư.`,
+                    { parse_mode: 'HTML' });
+                notifyAdmins(`${P('fail')} Lỗi đơn QR <code>${order.code}</code>: ${escapeHtml(e.message)}. Đã hoàn tiền.`);
+                return;
+            }
+
+            if (!res.success) {
+                await DB.addBalanceAtomic(telegramId, order.amount, 'REFUND', `refund:${internalOrderId}`, {
+                    reason: res.error, orderId: internalOrderId,
+                });
+                await DB.addBalance(telegramId, 0);
+                await sendMessageRaw(telegramId,
+                    `${t(u.lang, 'pay_direct_fail', escapeHtml(res.error || 'unknown'))}\n\n${P('success')} Số tiền <b>${money(order.amount)}</b> đã được cộng vào số dư.`,
                     { parse_mode: 'HTML' });
                 notifyAdmins(
                     `${P('warn')} <b>ĐƠN QR LỖI (ĐÃ HOÀN VÀO SỐ DƯ)</b>\n${P('plus')} Code: <code>${order.code}</code>\n` +
-                    `${P('plus')} <code>${telegramId}</code>\n${P('balance')} ${money(amount)}\n${P('fail')} ${escapeHtml(res.error || '')}`
+                    `${P('plus')} <code>${telegramId}</code>\n${P('balance')} ${money(order.amount)}\n${P('fail')} ${escapeHtml(res.error || '')}`
                 );
                 return;
             }
 
             await DB.addOrder(telegramId, {
                 orderId: res.orderId, productName: res.productName,
-                price: order.amount, basePrice: order.basePrice, profit: order.profit,
+                price: Math.round(order.amount), basePrice: Math.round(order.basePrice || 0),
+                profit: Math.round(order.profit || 0),
                 quantity: order.quantity || 1,
                 username: res.username, password: res.password,
                 status: 'success', via: 'direct_qr',
                 couponCode: order.couponCode || null,
             });
 
-            await DB.addTotalIn(telegramId, amount);
+            await DB.addTotalIn(telegramId, Math.round(order.amount));
+            await OrderState.update(internalOrderId, { status: 'DELIVERED', shopOrderId: res.orderId });
 
             await deliverAccount(telegramId, telegramId, u, res);
 
@@ -2818,11 +3329,7 @@ async function handleCredit({ type, telegramId, amount, order }) {
                 `${P('total_in')} Lợi nhuận: <b>${money(order.profit)}</b> (mã ${order.code})`
             );
         } catch (e) {
-            await DB.addBalance(telegramId, amount, true);
-            await sendMessageRaw(telegramId,
-                `${t(u.lang, 'pay_direct_fail', escapeHtml(e.message))}\n\n${P('success')} Số tiền <b>${money(amount)}</b> đã được cộng vào số dư của bạn do lỗi hệ thống.`,
-                { parse_mode: 'HTML' });
-            notifyAdmins(`${P('fail')} Lỗi xử lý đơn QR <code>${order.code}</code>: ${escapeHtml(e.message)}. Đã hoàn tiền vào số dư.`);
+            console.error('[handleCredit pay]', e.code || '', e.message);
         }
         return;
     }
@@ -2852,7 +3359,7 @@ cron.schedule('*/15 * * * * *', async () => {
     scanRequested = false;
     scanRunning = true;
     try { await Deposit.scanAndCredit(handleCredit); }
-    catch (e) { console.error('[Cron bank]', e.message); }
+    catch (e) { console.error('[Cron bank]', e.code || '', e.message); }
     finally { scanRunning = false; }
 });
 
@@ -2870,15 +3377,34 @@ cron.schedule('*/5 * * * *', async () => {
     } catch (e) { console.error('[Cron pending]', e.message); }
 });
 
+cron.schedule('*/5 * * * *', async () => {
+    try {
+        const stuck = await OrderState.findStuck(CFG.STUCK_ORDER_MIN);
+        for (const o of stuck) {
+            if (o.notified) continue;
+            const age = Math.round((Date.now() - new Date(o.updatedAt).getTime()) / 60000);
+            notifyAdmins(
+                `${P('warn')} <b>ĐƠN LỖI PHÁT HIỆN</b>\n` +
+                `Order: <code>${o.orderId}</code>\n` +
+                `User: <code>${o.telegramId}</code>\n` +
+                `Status: <b>${o.status}</b>\n` +
+                `Age: <b>${age} min</b>\n` +
+                `Attempts: ${o.attempts || 0}` +
+                (o.lastError ? `\nError: ${escapeHtml(o.lastError)}` : '') +
+                `\n\nDùng /admin → Đơn lỗi để xử lý.`
+            );
+            await OrderState.update(o.orderId, { notified: true });
+        }
+    } catch (e) { console.error('[Cron stuck]', e.message); }
+});
+
 async function checkPremiumSupport() {
     if (!CFG.USE_PREMIUM_EMOJI) {
         PREMIUM_OK = false;
-        console.log('[Premium] Disabled by env');
         return;
     }
     if (!ADMIN_IDS.length) {
         PREMIUM_OK = false;
-        console.log('[Premium] No admin to test → disable');
         return;
     }
     const testId = ADMIN_IDS[0];
@@ -2901,7 +3427,32 @@ async function checkPremiumSupport() {
     }
 }
 
+function maskSecret(s) {
+    if (!s) return '(empty)';
+    if (s.length <= 8) return '***';
+    return s.slice(0, 4) + '***' + s.slice(-4);
+}
+
+function validateEnv() {
+    const required = ['BOT_TOKEN', 'SHOP_API_BASE', 'SHOP_API_TOKEN'];
+    const missing = required.filter(k => !process.env[k]);
+    if (missing.length) {
+        console.error('[ENV] Missing required:', missing.join(', '));
+        process.exit(1);
+    }
+    if (CFG.DB_MODE === 'mysql') {
+        const dbReq = ['MYSQL_HOST', 'MYSQL_USER', 'MYSQL_DATABASE'];
+        const miss2 = dbReq.filter(k => !process.env[k]);
+        if (miss2.length) {
+            console.error('[ENV] Missing MySQL:', miss2.join(', '));
+            process.exit(1);
+        }
+    }
+    console.log('[ENV] OK');
+}
+
 (async () => {
+    validateEnv();
     await DB.init();
     ensureApiDoc();
     await setupCommands();
@@ -2909,10 +3460,9 @@ async function checkPremiumSupport() {
     const bin = getBankBin();
     console.log('Bot started');
     console.log('DB Mode:', CFG.DB_MODE);
-    console.log('Redis:', CFG.REDIS_ENABLED ? `ON (${CFG.REDIS.host}:${CFG.REDIS.port}, prefix="${CFG.REDIS_PREFIX}")` : 'OFF');
+    console.log('Redis:', CFG.REDIS_ENABLED ? `ON (${CFG.REDIS.host}:${CFG.REDIS.port})` : 'OFF');
     console.log('Shop API:', CFG.SHOP_API_BASE);
-    console.log('API Docs:', API_INFO.docsUrl);
-    console.log('API Doc File:', API_DOC_PATH);
+    console.log('Token:', maskSecret(CFG.SHOP_API_TOKEN));
     console.log('Bank:', CFG.BANK_NAME, CFG.BANK_ACCOUNT, '| BIN:', bin || 'KHÔNG TÌM THẤY');
     console.log('Admins:', ADMIN_IDS.join(', ') || '(none)');
     console.log('Premium Emoji:', PREMIUM_OK ? 'ON' : 'OFF');
@@ -2920,5 +3470,32 @@ async function checkPremiumSupport() {
     console.log('Chiết khấu:', discountLabel());
 })();
 
-process.on('unhandledRejection', (e) => console.error('[UnhandledRejection]', e));
-process.on('uncaughtException', (e) => console.error('[UncaughtException]', e));
+let shuttingDown = false;
+
+async function gracefulShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[Shutdown] Received ${signal}`);
+
+    try {
+        await bot.stopPolling({ cancel: true });
+    } catch (e) { }
+
+    await new Promise(r => setTimeout(r, 1000));
+
+    try {
+        if (RedisClient) await RedisClient.quit();
+    } catch (e) { }
+
+    console.log('[Shutdown] Done');
+    process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+process.on('unhandledRejection', (e) => console.error('[UnhandledRejection]', e?.code || '', e?.message || e));
+process.on('uncaughtException', (e) => {
+    console.error('[UncaughtException]', e?.code || '', e?.message || e);
+    if (e?.code === 'ECONNREFUSED' || e?.message?.includes('Redis')) return;
+});
