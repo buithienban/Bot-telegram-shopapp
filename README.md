@@ -92,3 +92,139 @@ An automated sales Telegram bot featuring Premium Emoji support, bank QR top-ups
 - npm or yarn
 - (Optional) MySQL >= 5.7 if using `DB_MODE=mysql`
 - Run `node namefile.js --addsql` to inject database tables
+
+Kiến trúc mẫu nếu muốn rebuild - Reference architecture for a rebuild
+
+telebot/
+├── index.js
+├── package.json
+├── .env
+├── .env.example
+├── .gitignore
+│
+├── src/
+│   ├── config/
+│   │   ├── index.js
+│   │   ├── constants.js
+│   │   └── emoji.js
+│   │
+│   ├── lib/
+│   │   ├── logger.js
+│   │   ├── errors.js
+│   │   ├── money.js
+│   │   ├── html.js
+│   │   ├── mutex.js
+│   │   └── crypto.js
+│   │
+│   ├── infra/
+│   │   ├── redis/
+│   │   │   ├── client.js
+│   │   │   ├── r.js
+│   │   │   └── stateStore.js
+│   │   │
+│   │   ├── db/
+│   │   │   ├── index.js
+│   │   │   ├── json/
+│   │   │   │   └── adapter.js
+│   │   │   └── mysql/
+│   │   │       ├── adapter.js
+│   │   │       └── schema.sql
+│   │   │
+│   │   └── telegram/
+│   │       ├── bot.js
+│   │       ├── tgCall.js
+│   │       ├── sendMessage.js
+│   │       ├── sendMedia.js
+│   │       └── safeSend.js
+│   │
+│   ├── domain/
+│   │   ├── users/
+│   │   │   ├── userService.js
+│   │   │   └── rankService.js
+│   │   │
+│   │   ├── ledger/
+│   │   │   └── ledger.js
+│   │   │
+│   │   ├── orders/
+│   │   │   ├── orderState.js
+│   │   │   └── orderService.js
+│   │   │
+│   │   ├── payments/
+│   │   │   ├── pending.js
+│   │   │   ├── deposit.js
+│   │   │   └── creditHandler.js
+│   │   │
+│   │   ├── products/
+│   │   │   ├── shopApi.js
+│   │   │   └── priceService.js
+│   │   │
+│   │   ├── coupons/
+│   │   │   └── couponService.js
+│   │   │
+│   │   ├── settings/
+│   │   │   └── settings.js
+│   │   │
+│   │   └── bank/
+│   │       ├── bankApi.js
+│   │       └── vietqr.js
+│   │
+│   ├── handlers/
+│   │   ├── user/
+│   │   │   ├── start.js
+│   │   │   ├── products.js
+│   │   │   ├── search.js
+│   │   │   ├── account.js
+│   │   │   ├── deposit.js
+│   │   │   ├── history.js
+│   │   │   ├── language.js
+│   │   │   ├── support.js
+│   │   │   ├── help.js
+│   │   │   └── index.js
+│   │   │
+│   │   ├── admin/
+│   │   │   ├── home.js
+│   │   │   ├── stats.js
+│   │   │   ├── users.js
+│   │   │   ├── orders.js
+│   │   │   ├── pending.js
+│   │   │   ├── stuck.js
+│   │   │   ├── manualDeposit.js
+│   │   │   ├── findUser.js
+│   │   │   ├── balanceAdjust.js
+│   │   │   ├── toggleBan.js
+│   │   │   ├── broadcast.js
+│   │   │   ├── discount.js
+│   │   │   ├── config.js
+│   │   │   └── index.js
+│   │   │
+│   │   └── router/
+│   │       ├── commands.js
+│   │       ├── messages.js
+│   │       ├── callbacks.js
+│   │       └── setupCommands.js
+│   │
+│   ├── i18n/
+│   │   ├── index.js
+│   │   ├── vi.js
+│   │   └── en.js
+│   │
+│   ├── services/
+│   │   ├── purchaseService.js
+│   │   ├── deliveryService.js
+│   │   ├── apiDocsService.js
+│   │   └── notifyService.js
+│   │
+│   ├── workers/
+│   │   ├── bankScanner.js
+│   │   ├── pendingCleanup.js
+│   │   ├── stuckDetector.js
+│   │   └── index.js
+│   │
+│   └── bootstrap/
+│       ├── startup.js
+│       ├── healthcheck.js
+│       └── shutdown.js
+│
+├── data/
+└── docs/
+
